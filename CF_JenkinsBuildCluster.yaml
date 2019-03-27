@@ -1,0 +1,514 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy Jenkins master.
+              Creates Autoscaling group to spawn Jenkins Slaves.
+              Creates Lambda and Alarm to monitor Jenkins Queue size and scale in/out slaves based on Queue size'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  JenkinsUser:
+    Description: User name to call Jenkins master API.
+    Type: 'String'
+    Default: '____SET_ME____'
+  JenkinsPassword:
+    Description: Password to call Jenkins master API.
+    Type: 'String'
+    Default: '____SET_ME____'
+  JenkinsLabels:
+    Description: Jenkins labels to monitor.
+    Type: 'String'
+    Default: '____SET_ME____'
+  DockerRegistry:
+    Description: Docker registry to pull Docker images.
+    Type: 'String'
+    Default: '____SET_ME____'
+  DockerUser:
+    Description: User name to login the given Docker registry.
+    Type: 'String'
+    Default: '____SET_ME____'
+  DockerPassword:
+    Description: Password to login the given Docker registry.
+    Type: 'String'
+    Default: '____SET_ME____'
+  EFSVolumeIP:
+    Description: EFS volume IP address to mount it.
+    Type: 'String'
+    Default: '____SET_ME____'
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  MasterHomeVolume:
+    Description: Id of an existing EBS volume, it will be used as Jenkins master home(can be populated with data).
+    Type: AWS::EC2::Volume::Id
+    Default: ____SET_ME____
+    ConstraintDescription: Must be the id of an existing volume.
+  CCACHEVolume:
+    Description: Id of an existing EBS volume, it will be used as a ccache volume shared with slaves over NFS.
+    Type: AWS::EC2::Volume::Id
+    Default: ____SET_ME____
+    ConstraintDescription: Must be the id of an existing volume.
+Mappings:
+  Constants:
+    BuildCluster:
+      JenkinsMasterQueueMetric: '-jenkinsqueue-metric'
+      VPCId: ____SET_ME____
+    JenkinsMaster:
+      InstanceType: t3.xlarge
+      SubnetId: ____SET_ME____
+    JenkinsSlaves:
+      Subnets:
+        - ____SET_ME____
+      AZs:
+        - ____SET_ME____
+Resources:
+  JenkinsMasterSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-jenkinsmaster-sg'
+      GroupDescription: Enable HTTP access via ports 8080,50000 locked down to the load balancer
+        + SSH access
+      VpcId: !FindInMap [ Constants, BuildCluster, VPCId ]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '50000'
+          ToPort: '50000'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
+
+  JenkinsMasterInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          jenkins_master_launch:
+            - setup_cfn
+            - setup_jenkins_master
+        setup_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Jenkins.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource JenkinsMasterInstance --configsets jenkins_master_launch --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        setup_jenkins_master:
+          commands:
+            00_mount_jenkins_home:
+              command: mkdir /jenkins_home; chmod 777 /jenkins_home; mount /dev/nvme1n1p1 /jenkins_home
+            01_start_jenkins:
+              command: docker run -d -t -v /jenkins_home:/var/jenkins_home -p 8080:8080 -p 50000:50000 --name jenkinsmaster --restart=always jenkins/jenkins:lts
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !FindInMap [ Constants, JenkinsMaster, InstanceType ]
+      SecurityGroupIds:
+        - !GetAtt JenkinsMasterSG.GroupId
+      KeyName: !Ref 'KeyName'
+      SubnetId: !FindInMap [ Constants, JenkinsMaster, SubnetId ]
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !Ref MasterHomeVolume
+        - Device: /dev/sdg
+          VolumeId: !Ref CCACHEVolume
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-bootstrap docker
+
+          echo '{ "insecure-registries" : ["'${DockerRegistry}'"] }' > /etc/docker/daemon.json
+          systemctl restart docker
+
+          docker login -u ${DockerUser} -p ${DockerPassword} ${DockerRegistry}
+          mkdir /nfsccache; chmod 777 /nfsccache; mount /dev/nvme2n1p1 /nfsccache
+
+          docker run -d \
+            --privileged \
+            --name nfsccache \
+            --restart=always \
+            -v /nfsccache:/ccache \
+            -p 111:111 -p 111:111/udp \
+            -p 2049:2049 -p 2049:2049/udp \
+            -p 32765:32765 -p 32765:32765/udp \
+            -p 32766:32766 -p 32766:32766/udp \
+            -p 32767:32767 -p 32767:32767/udp \
+            -e NFS_EXPORT_DIR_1=/ccache \
+            -e NFS_EXPORT_DOMAIN_1=* \
+            -e NFS_EXPORT_OPTIONS_1=rw,insecure,async,no_subtree_check,no_root_squash,fsid=1 \
+            ${DockerRegistry}/my-docker/my-aws-env-nfs:latest
+
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsMasterInstance --configsets jenkins_master_launch --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource JenkinsMasterInstance --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+
+  JenkinsSlavesSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-jenkinsslaves-sg'
+      GroupDescription: Enable SSH access
+      VpcId: vpc-d1b3cebc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+
+  JenkinsSlavesLT:
+    Type: "AWS::EC2::LaunchTemplate"
+    DependsOn:
+      - JenkinsMasterInstance
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-jenkinsslaves-lt'
+      LaunchTemplateData:
+        KeyName: !Ref 'KeyName'
+        SecurityGroupIds:
+          - !GetAtt JenkinsSlavesSG.GroupId
+        ImageId: !Ref LatestAmiId
+        # !FindInMap [AWSRegionArch2AMI, !Ref 'AWS::Region', !FindInMap [AWSInstanceType2Arch, !Ref InstanceType, Arch]]
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              DeleteOnTermination: true
+              VolumeSize: 150
+        UserData:
+          Fn::Base64: !Sub |
+                #!/bin/bash -xe
+                yum update -y
+                yum install -y aws-cfn-bootstrap docker nfs-utils
+
+                JENKINS_LABELS="docker_client sanitychecker x86-ui-test docker_client_platformx"
+
+                # NFS storage - ccache doesn't support EFS
+                NFSCACHESRV=${JenkinsMasterInstance.PrivateIp}
+                NFSCACHEDIR="/nfsccache"
+                #EFS storage
+                WORKSHARESRV=${EFSVolumeIP}
+                WORKSHAREDIR=/workshare
+                # Instance name
+                INSTANCEID="$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+
+                echo '{ "insecure-registries" : ["'${DockerRegistry}'"] }' > /etc/docker/daemon.json
+                systemctl restart docker
+
+                mkdir -p $NFSCACHEDIR
+                mount -t nfs -o noatime,async,rw,nolock,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport $NFSCACHESRV:/ccache $NFSCACHEDIR
+                mkdir -p $WORKSHAREDIR
+                mount -t nfs -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport $WORKSHARESRV:/ $WORKSHAREDIR
+
+                docker network create jenkins-bridge
+                docker login -u ${DockerUser} -p ${DockerPassword} ${DockerRegistry}
+
+                # Run jenkins slave container
+                docker run -d \
+                  --name $INSTANCEID \
+                  -h $INSTANCEID \
+                  -e "JENKINS_URL=http://${JenkinsMasterInstance.PrivateIp}:8080" \
+                  -e "JENKINS_LABELS=$JENKINS_LABELS" \
+                  -v $WORKSHAREDIR/SlavesHomeBuild:/home/build \
+                  -v /var/run/docker.sock:/var/run/docker.sock \
+                  ${DockerRegistry}/my-docker/docker-ubuntu-pipeline-agent:aws-latest
+              - JENKINS_IP: !GetAtt JenkinsMasterInstance.PrivateIp
+
+  JenkinsSlavesASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-jenkinsslaves-asg'
+      VPCZoneIdentifier: !FindInMap [Constants, JenkinsSlaves, Subnets]
+      AvailabilityZones: !FindInMap [Constants, JenkinsSlaves, AZs]
+      Cooldown: 300
+      HealthCheckGracePeriod: 300
+      # HealthCheckType: String
+      DesiredCapacity: 0
+      MaxSize: 10
+      MinSize: 0
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          # OnDemandAllocationStrategy: String
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: lowest-price
+          SpotInstancePools: 2
+          # SpotMaxPrice: String
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref 'JenkinsSlavesLT'
+            Version: 1
+          Overrides:
+            - InstanceType: c3.4xlarge
+            - InstanceType: c4.4xlarge
+            - InstanceType: c5.4xlarge
+            - InstanceType: c5d.4xlarge
+            - InstanceType: m4.4xlarge
+            - InstanceType: c3.8xlarge
+            - InstanceType: c4.8xlarge
+            - InstanceType: c5.9xlarge
+            - InstanceType: c5d.9xlarge
+            - InstanceType: m4.10xlarge
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupMaxSize
+            - GroupMinSize
+            - GroupDesiredCapacity
+            - GroupTerminatingInstances
+            - GroupPendingInstances
+            - GroupTotalInstances
+            - GroupInServiceInstances
+            - GroupStandbyInstances
+
+  JenkinsQueueSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-jenkinsqueue-alarm'
+      AlarmDescription: Scale-up if Jenkins Queue is not empty
+      MetricName: !Join ['', [!Sub '${AWS::StackName}', !FindInMap [Constants, BuildCluster, JenkinsMasterQueueMetric]]]
+      Namespace: BuildEnv/Jenkins
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref 'JenkinsSlavesASGScaleUpPolicy']
+      Dimensions:
+      - Name: JobsInQueue
+        Value: JOBS
+      ComparisonOperator: GreaterThanThreshold
+
+  JenkinsSlavesASGScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref 'JenkinsSlavesASG'
+      PolicyType: StepScaling
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 2
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 2
+          MetricIntervalUpperBound: 5
+          ScalingAdjustment: 2
+        - MetricIntervalLowerBound: 5
+          ScalingAdjustment: 4
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - autoscaling:SetDesiredCapacity
+            - autoscaling:TerminateInstanceInAutoScalingGroup
+            - autoscaling:DescribeAutoScalingGroups
+            - autoscaling:DescribeAutoScalingInstances
+            - autoscaling:SetInstanceProtection
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ec2:DescribeInstances
+            - ec2:CreateTags
+            - ec2:DeleteTags
+            - ec2:DescribeNetworkInterfaces
+            - ec2:CreateNetworkInterface
+            - ec2:DeleteNetworkInterface
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+
+  LambdaSchedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: A schedule for the Lambda function.
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaFunction.Arn}
+          Id: LambdaSchedule
+
+  LambdaSchedulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaSchedule.Arn}
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Lambda function that monitors Jenkins and kills idle slaves
+      FunctionName: !Sub '${AWS::StackName}-jenkinsmonitor-lf'
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt JenkinsSlavesSG.GroupId
+          # - sg-07073dbf0688e8605
+        SubnetIds: !FindInMap [Constants, JenkinsSlaves, Subnets]
+      Timeout: 50
+      Runtime: python2.7
+      MemorySize: 128
+      Environment:
+        Variables:
+          JENKINSSERVER: !Join ['', ['http://', !GetAtt 'JenkinsMasterInstance.PrivateIp', ':8080']]
+          JENKINSUSR: !Ref JenkinsUser
+          JENKINSPASS: !Ref JenkinsPassword
+          JENKINSLABELS: !Ref JenkinsLabels
+          JENKINSQUEUEMETRIC: !Join ['', [!Sub '${AWS::StackName}', !FindInMap [Constants, BuildCluster, JenkinsMasterQueueMetric]]]
+          JENKINSSLAVESASG: !Ref 'JenkinsSlavesASG'
+      Handler: index.main_handler
+      Role: !Sub ${LambdaExecutionRole.Arn}
+      Code:
+        ZipFile: |
+          import time
+          from botocore.vendored import requests
+          import json
+          import re
+          import os
+          import boto3
+          JENKINSSERVER = os.environ['JENKINSSERVER']
+          JENKINSUSR = os.environ['JENKINSUSR']
+          JENKINSPASS = os.environ['JENKINSPASS']
+          JENKINSLABELS = os.environ['JENKINSLABELS'].split(",")
+          JENKINSQUEUEMETRIC = os.environ['JENKINSQUEUEMETRIC']
+          JENKINSSLAVESASG = os.environ['JENKINSSLAVESASG']
+          MAXIDELTIME = 300
+          REQ_TIMEOUT = (30,30)
+          session = requests.Session()
+          session.auth = (JENKINSUSR, JENKINSPASS)
+
+          def get_queue():
+            try:
+              resp = session.get('{}/queue/api/json'.format(JENKINSSERVER), timeout=REQ_TIMEOUT)
+            except requests.exceptions.RequestException as e:
+              return None
+            queueInfo = resp.json()
+            jobs = []
+            for j in queueInfo['items']:
+              if len(re.findall('BuildableItem$', j['_class']))>0:
+                QueueDuration = int(time.time() * 1000 - j['inQueueSince'])/1000
+                jobs.append({'url': j['url'], 'why': j['why'], 'queue_duration': QueueDuration})
+              else:
+                continue
+            return jobs
+
+          def get_computer_stat(nodeName):
+            try:
+              resp = session.get("{}/computer/{}/api/json".format(JENKINSSERVER,nodeName), timeout=REQ_TIMEOUT)
+              if resp.status_code == requests.codes.ok:
+                return resp.json()
+            except requests.exceptions.RequestException as e:
+              print ("Http Error:",e)
+
+            return None
+
+          def toggle_computer_offline(nodeName):
+            try:
+              resp = session.post("{}/computer/{}/toggleOffline?offlineMessage=Taken_down".format(JENKINSSERVER,nodeName), timeout=REQ_TIMEOUT)
+              if resp.status_code == requests.codes.ok:
+                return True
+            except requests.exceptions.RequestException as e:
+              print ("Http Error:",e)
+
+            return None
+
+          def get_ec2_tag(ec2, InstanceId, tagKey):
+            node_awsinfo = ec2.describe_instances(InstanceIds=[InstanceId])
+            node_tags = node_awsinfo['Reservations'][0]['Instances'][0]['Tags']
+            for tag in node_tags:
+              if tag['Key'] == tagKey :
+                return tag['Value']
+
+            return None
+
+          def main_handler(event, context):
+            queue = get_queue()
+            Qsize=0
+            if queue:
+              for q in queue:
+                for l in JENKINSLABELS :
+                  if ( q['why'].find("There are no nodes with the label") != -1 or \
+                   q['why'].find("t have label") != -1 ) and q['why'].find(l) != -1 :
+                    Qsize+=1
+
+                if q['why'].find("Waiting for next available executor on") != -1 :
+                  Qsize+=1
+
+            cw = boto3.client('cloudwatch')
+            resp = cw.put_metric_data( MetricData=[{ 'MetricName': JENKINSQUEUEMETRIC,
+                                          'Dimensions': [{'Name': 'JobsInQueue','Value': 'JOBS'},],
+                                          'Unit': 'Count','Value': Qsize },], Namespace='BuildEnv/Jenkins')
+
+            asg = boto3.client('autoscaling')
+            ec2 = boto3.client('ec2')
+
+            response = asg.describe_auto_scaling_groups(AutoScalingGroupNames = [JENKINSSLAVESASG])
+            asg_instances = response['AutoScalingGroups'][0]['Instances']
+
+            for inst in asg_instances:
+              node = inst['InstanceId']
+              node_JenkinsInfo = get_computer_stat(node)
+
+              if node_JenkinsInfo is not None and not node_JenkinsInfo['idle'] and not node_JenkinsInfo['offline']:
+                response = asg.set_instance_protection(InstanceIds=[node], AutoScalingGroupName=JENKINSSLAVESASG, ProtectedFromScaleIn=True)
+                response = ec2.delete_tags(Resources=[node], Tags=[{'Key': 'IdleSince'}])
+              else:
+                node_IdleSince = get_ec2_tag(ec2, node, 'IdleSince')
+                if node_IdleSince is not None :
+                  if int(time.time())-int(node_IdleSince) >= MAXIDELTIME :
+                    toggle_computer_offline(node)
+                    response = asg.set_instance_protection(InstanceIds=[node], AutoScalingGroupName=JENKINSSLAVESASG, ProtectedFromScaleIn=False)
+                    try:
+                        response = asg.terminate_instance_in_auto_scaling_group( InstanceId=node, ShouldDecrementDesiredCapacity=True)
+                    except Exception as e:
+                        response = e
+                else:
+                  response = ec2.create_tags(Resources=[node], Tags=[{'Key': 'IdleSince', 'Value': str(int(time.time()))}])
+
+Outputs:
+  JenkinsSlavesASGName:
+    Description: AutoScaling group name
+    Value: !Ref 'JenkinsSlavesASG'
+  JenkinsMasterURL:
+    Description: Jenkins master panel
+    Value: !Join ['', ['http://', !GetAtt 'JenkinsMasterInstance.PrivateIp', ':8080']]
