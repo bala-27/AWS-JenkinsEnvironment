@@ -66,8 +66,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${AWS::StackName}-jenkinsmaster-sg'
-      GroupDescription: Enable HTTP access via ports 8080,50000 locked down to the load balancer
-        + SSH access
+      GroupDescription: Enable HTTP access via ports 8080,50000 locked down to the load balancer and SSH access
       VpcId: !FindInMap [ Constants, BuildCluster, VPCId ]
       SecurityGroupIngress:
         - IpProtocol: tcp
